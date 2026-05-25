@@ -1,4 +1,4 @@
-# Build refsprogs for Windows (MinGW-w64 via MSYS2).
+# Build refsprogs for Windows via Ubuntu + mingw-w64 cross-compile.
 name: build
 
 on:
@@ -13,81 +13,58 @@ permissions: read-all
 
 jobs:
   build_windows:
-    name: ${{ matrix.msystem }}
-    runs-on: windows-latest
+    name: windows-${{ matrix.arch }}
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          - msystem: MINGW64
-            arch: x86_64
-            prefix: mingw-w64-x86_64
-          - msystem: MINGW32
-            arch: i686
-            prefix: mingw-w64-i686
-    defaults:
-      run:
-        shell: msys2 {0}
+          - arch: x86_64
+            host: x86_64-w64-mingw32
+          - arch: i686
+            host: i686-w64-mingw32
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up MSYS2 (${{ matrix.msystem }})
-        uses: msys2/setup-msys2@v2
-        with:
-          msystem: ${{ matrix.msystem }}
-          update: false
-          install: >-
-            base-devel
-            git
-            autoconf
-            automake
-            libtool
-            pkg-config
-            ${{ matrix.prefix }}-toolchain
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get -y install \
+            autoconf \
+            automake \
+            libtool \
+            pkg-config \
+            build-essential \
+            mingw-w64
 
       - name: Generate build system
         run: ./autogen.sh
 
-      - name: Configure
+      - name: Configure (cross-compile for ${{ matrix.host }})
         run: |
           ./configure \
+            --host=${{ matrix.host }} \
             --disable-refs-fuse \
             --disable-library \
-            --prefix=/mingw64 \
-            CFLAGS="-O2 -Wall"
+            CFLAGS="-O2 -Wall" \
+            LDFLAGS="-static -static-libgcc"
 
       - name: Build
         run: make -j$(nproc)
 
       - name: Stage artifacts
         run: |
-          mkdir -p dist/refsprogs-${{ matrix.arch }}
-          cp util/*.exe dist/refsprogs-${{ matrix.arch }}/
-          cp README COPYING AUTHORS NEWS ChangeLog dist/refsprogs-${{ matrix.arch }}/
-          cd dist/refsprogs-${{ matrix.arch }} && ls -la
-
-      - name: Bundle runtime DLLs
-        run: |
-          cd dist/refsprogs-${{ matrix.arch }}
-          # Resolve and copy non-system DLL dependencies from MSYS2's mingw runtime
-          # so the EXEs run on a stock Windows machine.
-          mingw_bin="/${{ matrix.msystem == 'MINGW64' && 'mingw64' || 'mingw32' }}/bin"
-          for exe in *.exe; do
-            ldd "$exe" \
-              | awk '{print $3}' \
-              | grep -i "^${mingw_bin}" \
-              | sort -u \
-              | while read -r dll; do
-                  [ -f "$dll" ] && cp -n "$dll" .
-                done
-          done
-          ls -la
+          mkdir -p dist/refsprogs-windows-${{ matrix.arch }}
+          cp util/*.exe dist/refsprogs-windows-${{ matrix.arch }}/
+          cp README COPYING AUTHORS NEWS ChangeLog dist/refsprogs-windows-${{ matrix.arch }}/
+          ${{ matrix.host }}-strip dist/refsprogs-windows-${{ matrix.arch }}/*.exe
+          ls -la dist/refsprogs-windows-${{ matrix.arch }}/
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: refsprogs-windows-${{ matrix.arch }}
-          path: dist/refsprogs-${{ matrix.arch }}
+          path: dist/refsprogs-windows-${{ matrix.arch }}
           if-no-files-found: error
 
   release:
