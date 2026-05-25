@@ -1,0 +1,116 @@
+# Build refsprogs for Windows (MinGW-w64 via MSYS2).
+name: build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+permissions: read-all
+
+jobs:
+  build_windows:
+    name: ${{ matrix.msystem }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - msystem: MINGW64
+            arch: x86_64
+            prefix: mingw-w64-x86_64
+          - msystem: MINGW32
+            arch: i686
+            prefix: mingw-w64-i686
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSYS2 (${{ matrix.msystem }})
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: ${{ matrix.msystem }}
+          update: false
+          install: >-
+            base-devel
+            git
+            autoconf
+            automake
+            libtool
+            pkg-config
+            ${{ matrix.prefix }}-toolchain
+
+      - name: Generate build system
+        run: ./autogen.sh
+
+      - name: Configure
+        run: |
+          ./configure \
+            --disable-refs-fuse \
+            --disable-library \
+            --prefix=/mingw64 \
+            CFLAGS="-O2 -Wall"
+
+      - name: Build
+        run: make -j$(nproc)
+
+      - name: Stage artifacts
+        run: |
+          mkdir -p dist/refsprogs-${{ matrix.arch }}
+          cp util/*.exe dist/refsprogs-${{ matrix.arch }}/
+          cp README COPYING AUTHORS NEWS ChangeLog dist/refsprogs-${{ matrix.arch }}/
+          cd dist/refsprogs-${{ matrix.arch }} && ls -la
+
+      - name: Bundle runtime DLLs
+        run: |
+          cd dist/refsprogs-${{ matrix.arch }}
+          # Resolve and copy non-system DLL dependencies from MSYS2's mingw runtime
+          # so the EXEs run on a stock Windows machine.
+          mingw_bin="/${{ matrix.msystem == 'MINGW64' && 'mingw64' || 'mingw32' }}/bin"
+          for exe in *.exe; do
+            ldd "$exe" \
+              | awk '{print $3}' \
+              | grep -i "^${mingw_bin}" \
+              | sort -u \
+              | while read -r dll; do
+                  [ -f "$dll" ] && cp -n "$dll" .
+                done
+          done
+          ls -la
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: refsprogs-windows-${{ matrix.arch }}
+          path: dist/refsprogs-${{ matrix.arch }}
+          if-no-files-found: error
+
+  release:
+    name: Attach to release
+    needs: build_windows
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Package
+        run: |
+          cd dist
+          for d in refsprogs-windows-*; do
+            zip -r "${d}.zip" "$d"
+          done
+          ls -la
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.zip
