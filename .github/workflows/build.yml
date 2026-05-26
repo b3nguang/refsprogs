@@ -1,4 +1,12 @@
 # Build refsprogs for Windows via Ubuntu + mingw-w64 cross-compile.
+#
+# Produces a flat dist directory containing:
+#   - the util binaries (refsls.exe, refscat.exe, ...) dynamically linked
+#     to librefs-13.dll
+#   - librefs-13.dll (the shared library, for FFI / library consumers)
+#   - librefs.dll.a (mingw import library, for build-time linking)
+#   - include/refs/*.h (public headers)
+#   - README / COPYING / AUTHORS / NEWS / ChangeLog
 name: build
 
 on:
@@ -40,25 +48,43 @@ jobs:
       - name: Generate build system
         run: ./autogen.sh
 
+      # `--enable-shared --disable-static` tells libtool to emit a DLL +
+      # mingw import library (.dll.a) instead of a static archive.
+      # `-static-libgcc` keeps the DLL / .exe free of the libgcc_s_seh-1.dll
+      # runtime dependency (the equivalent of the libewf / libbde DLLs that
+      # downstream consumers expect to be self-contained).
       - name: Configure (cross-compile for ${{ matrix.host }})
         run: |
           ./configure \
             --host=${{ matrix.host }} \
             --disable-refs-fuse \
-            --disable-library \
+            --enable-shared \
+            --disable-static \
             CFLAGS="-O2 -Wall" \
-            LDFLAGS="-static -static-libgcc"
+            LDFLAGS="-static-libgcc -Wl,--no-undefined"
 
       - name: Build
         run: make -j$(nproc)
 
+      # libtool on mingw lays the real artifacts under .libs/. The wrappers
+      # in util/ and librefs/ are scripts that wouldn't run on Windows.
       - name: Stage artifacts
         run: |
-          mkdir -p dist/refsprogs-windows-${{ matrix.arch }}
-          cp util/*.exe dist/refsprogs-windows-${{ matrix.arch }}/
-          cp README COPYING AUTHORS NEWS ChangeLog dist/refsprogs-windows-${{ matrix.arch }}/
-          ${{ matrix.host }}-strip dist/refsprogs-windows-${{ matrix.arch }}/*.exe
-          ls -la dist/refsprogs-windows-${{ matrix.arch }}/
+          out=dist/refsprogs-windows-${{ matrix.arch }}
+          mkdir -p "$out/include/refs"
+          # .exe binaries (dynamically linked to librefs-13.dll which sits
+          # next to them, so users can still just unzip and run).
+          cp util/.libs/*.exe "$out/" 2>/dev/null || cp util/*.exe "$out/"
+          # The shared library itself. Naming is `librefs-${LIBREFS_VERSION}.dll`
+          # per configure.ac (currently 13). Glob covers future version bumps.
+          cp librefs/.libs/librefs-*.dll "$out/"
+          # mingw import library — for downstreams that want build-time linking.
+          cp librefs/.libs/librefs.dll.a "$out/" || true
+          # Public headers so downstreams can `#include <refs/fsapi.h>`.
+          cp include/refs/*.h "$out/include/refs/"
+          cp README COPYING AUTHORS NEWS ChangeLog "$out/"
+          ${{ matrix.host }}-strip "$out"/*.exe "$out"/*.dll
+          ls -laR "$out/"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
