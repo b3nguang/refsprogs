@@ -5337,17 +5337,21 @@ static int fsapi_node_read_stream_visit_stream(
 		(fsapi_node_read_stream_context*) _context;
 	int err = 0;
 
-	fprintf(stderr, "[read_stream visit_stream] name=%.*s match=%d "
-		"size=%llu resident=%d stream_id=%llx linked=%llx\n",
-		(int)(name_length < 64 ? name_length : 64), name,
-		(name_length == context->stream_name_length &&
-			!memcmp(name, context->stream_name, name_length)) ? 1 : 0,
-		(unsigned long long) data_size,
-		(int) data_reference->resident,
-		data_reference->resident ? 0ULL :
-			(unsigned long long) data_reference->data.non_resident.stream_id,
-		data_reference->resident ? 0ULL :
-			(unsigned long long) data_reference->data.non_resident.linked_data_stream_id);
+	{
+		FILE *dbg = fopen("/tmp/refs_dbg.log", "a");
+		if(dbg) {
+			fprintf(dbg, "[visit_stream] name=%.*s size=%llu resident=%d "
+				"stream_id=%llx linked=%llx\n",
+				(int)(name_length < 64 ? name_length : 64), name,
+				(unsigned long long) data_size,
+				(int) data_reference->resident,
+				data_reference->resident ? 0ULL :
+					(unsigned long long) data_reference->data.non_resident.stream_id,
+				data_reference->resident ? 0ULL :
+					(unsigned long long) data_reference->data.non_resident.linked_data_stream_id);
+			fclose(dbg);
+		}
+	}
 
 	if(name_length != context->stream_name_length ||
 		memcmp(name, context->stream_name, name_length))
@@ -5411,10 +5415,16 @@ static int fsapi_node_read_stream_visit_data_stream_id(
 	fsapi_node_read_stream_context *const context =
 		(fsapi_node_read_stream_context*) _context;
 
-	fprintf(stderr, "[read_stream visit_data_stream_id] id=%llx target=%llx -> %s\n",
-		(unsigned long long) stream_id,
-		(unsigned long long) context->linked_data_stream_id,
-		(stream_id == context->linked_data_stream_id) ? "MATCH" : "skip");
+	{
+		FILE *dbg = fopen("/tmp/refs_dbg.log", "a");
+		if(dbg) {
+			fprintf(dbg, "[visit_data_stream_id] id=%llx target=%llx -> %s\n",
+				(unsigned long long) stream_id,
+				(unsigned long long) context->linked_data_stream_id,
+				(stream_id == context->linked_data_stream_id) ? "MATCH" : "skip");
+			fclose(dbg);
+		}
+	}
 
 	context->current_data_stream_id = stream_id;
 	context->in_target_stream =
@@ -5440,14 +5450,19 @@ static int fsapi_node_read_stream_visit_file_extent(
 
 	(void) first_logical_block;
 
-	fprintf(stderr, "[read_stream visit_file_extent] in_target=%d remaining=%llu "
-		"logical=%llu physical=%llu count=%llu unit=%u\n",
-		(int) context->in_target_stream,
-		(unsigned long long) context->remaining_bytes,
-		(unsigned long long) first_logical_block,
-		(unsigned long long) first_physical_block,
-		(unsigned long long) block_count,
-		(unsigned) block_index_unit);
+	{
+		FILE *dbg = fopen("/tmp/refs_dbg.log", "a");
+		if(dbg) {
+			fprintf(dbg, "[visit_file_extent] in_target=%d remaining=%llu "
+				"phys=%llu count=%llu unit=%u\n",
+				(int) context->in_target_stream,
+				(unsigned long long) context->remaining_bytes,
+				(unsigned long long) first_physical_block,
+				(unsigned long long) block_count,
+				(unsigned) block_index_unit);
+			fclose(dbg);
+		}
+	}
 
 	if(!context->in_target_stream || !context->remaining_bytes) {
 		goto out;
