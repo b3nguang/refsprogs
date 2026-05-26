@@ -49,7 +49,25 @@ struct refs_node_stream_data {
 	union {
 		const void *resident;
 		struct {
+			/* For a "normal" ADS stream this is non-zero and matches
+			 * the stream_id of subsequent node_stream_extent
+			 * callbacks. For ReFS file snapshots (the `:$SNAPSHOT`
+			 * streams created via `refsutil streamsnapshot`) this
+			 * is 0 — those streams' content lives in a parallel
+			 * 0x80 attribute and is associated by
+			 * @ref linked_data_stream_id. */
 			u64 stream_id;
+
+			/* Set when this 0xB0 named stream attribute references
+			 * a 0x80 unnamed $DATA attribute by ID (the `0x1001`-
+			 * style link). The matching 0x80 attribute is the one
+			 * the @ref node_data_stream_id callback fires with
+			 * this value; consumers should collect the extents
+			 * reported between that node_data_stream_id and the
+			 * next one and use them to read the stream's bytes.
+			 * Zero for "normal" ADS streams that carry their own
+			 * stream_id. */
+			u64 linked_data_stream_id;
 		} non_resident;
 	} data;
 };
@@ -197,6 +215,28 @@ struct refs_node_walk_visitor {
 		refs_symlink_type type,
 		const char *target,
 		size_t target_length);
+
+	/* Fires once for each 0x80 unnamed $DATA attribute encountered
+	 * during the walk, with the attribute's data-stream ID extracted
+	 * from key offset 0x10 (a u64). ReFS gives the file's default
+	 * $DATA a well-known ID of 0x1000; named streams created by
+	 * `refsutil streamsnapshot` and other ADS-style features get
+	 * unique IDs (typically 0x1001 / 0x1002 / ...) referenced from a
+	 * sibling 0xB0 attribute via @ref
+	 * refs_node_stream_data::non_resident::linked_data_stream_id.
+	 *
+	 * Subsequent @ref node_file_extent events belong to this
+	 * `stream_id` until the next @ref node_data_stream_id call or the
+	 * end of the node walk. Consumers can build a `stream_id ->
+	 * extent list` map and look up the bytes for each named stream by
+	 * matching its `linked_data_stream_id` against that map.
+	 *
+	 * Optional: may be left NULL by visitors that don't care about
+	 * stream-level extent routing (e.g. legacy callers that only want
+	 * the file's default $DATA). */
+	int (*node_data_stream_id)(
+		void *context,
+		u64 stream_id);
 };
 
 typedef struct refs_node_cache refs_node_cache;

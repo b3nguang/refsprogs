@@ -5173,6 +5173,567 @@ out:
 	return err;
 }
 
+/* ============================================================================
+ * Named-stream listing / reading APIs.
+ *
+ * ReFS named data streams (regular ADS, refsutil streamsnapshot
+ * `:$SNAPSHOT`, ...) live as `0xB0` attributes on the file. Their bytes
+ * sit in a sibling `0x80` unnamed-$DATA attribute referenced by ID. The
+ * file's default $DATA uses the well-known ID 0x1000; named streams
+ * carry per-file IDs (typically 0x1001 / 0x1002 / ...). The 0xB0
+ * attribute's value stores the linked ID at offset 0x44, which the
+ * underlying parser surfaces via
+ * @ref refs_node_stream_data::non_resident::linked_data_stream_id.
+ *
+ * Listing is a single walk that emits each `node_stream` event to the
+ * caller. Reading is a two-pass walk:
+ *
+ *   1. Find the target stream by name; capture either its resident
+ *      bytes (which we hand to the iohandler directly) or its
+ *      linked_data_stream_id.
+ *   2. For the non-resident case, walk again with
+ *      `node_data_stream_id` + `node_file_extent` listeners that route
+ *      the matching 0x80 attribute's extents through the iohandler.
+ * ============================================================================ */
+
+typedef struct {
+	void *user_context;
+	int (*stream_handler)(
+		void *context,
+		const char *name,
+		size_t name_length,
+		u64 data_size,
+		sys_bool is_resident);
+} fsapi_node_list_streams_context;
+
+static int fsapi_node_list_streams_visit_stream(
+		void *const _context,
+		const char *const name,
+		const size_t name_length,
+		const u64 data_size,
+		const refs_node_stream_data *const data_reference)
+{
+	fsapi_node_list_streams_context *const context =
+		(fsapi_node_list_streams_context*) _context;
+
+	return context->stream_handler(
+		context->user_context,
+		name,
+		name_length,
+		data_size,
+		data_reference->resident);
+}
+
+int fsapi_node_list_streams(
+		fsapi_volume *const vol,
+		fsapi_node *const node,
+		void *const context,
+		int (*const stream_handler)(
+			void *context,
+			const char *name,
+			size_t name_length,
+			u64 data_size,
+			sys_bool is_resident))
+{
+	int err = 0;
+
+	fsapi_node_list_streams_context list_context;
+	refs_node_crawl_context crawl_context;
+	refs_node_walk_visitor visitor;
+
+	memset(&list_context, 0, sizeof(list_context));
+	memset(&crawl_context, 0, sizeof(crawl_context));
+	memset(&visitor, 0, sizeof(visitor));
+
+	fsapi_log_enter("vol=%p, node=%p, context=%p, stream_handler=%p",
+		vol, node, context, stream_handler);
+
+	if((!node->key || !node->record) || node->is_short_entry) {
+		err = 0;
+		goto out;
+	}
+
+	list_context.user_context = context;
+	list_context.stream_handler = stream_handler;
+	visitor.context = &list_context;
+	visitor.node_stream = fsapi_node_list_streams_visit_stream;
+
+	crawl_context = refs_volume_init_node_crawl_context(
+		/* refs_volume *vol */
+		vol->vol);
+
+	err = parse_level3_long_value(
+		/* refs_node_crawl_context *crawl_context */
+		&crawl_context,
+		/* refs_node_walk_visitor *visitor */
+		&visitor,
+		/* const char *prefix */
+		"",
+		/* size_t indent */
+		1,
+		/* u64 parent_node_object_id */
+		node->parent_directory_object_id,
+		/* u64 node_number */
+		node->node_number,
+		/* u16 entry_offset */
+		node->entry_offset,
+		/* const u8 *key */
+		node->key,
+		/* u16 key_size */
+		node->key_size,
+		/* const u8 *value */
+		node->record,
+		/* u16 value_offset */
+		0,
+		/* u16 value_size */
+		node->record_size,
+		/* void *context */
+		NULL);
+	if(err == -1) {
+		/* Handler signalled early termination. */
+		err = 0;
+	}
+	else if(err) {
+		sys_log_perror(err, "Error while listing streams");
+	}
+
+out:
+	fsapi_log_leave(err, "vol=%p, node=%p, context=%p, stream_handler=%p",
+		vol, node, context, stream_handler);
+
+	return err;
+}
+
+typedef struct {
+	refs_volume *vol;
+	const char *stream_name;
+	size_t stream_name_length;
+	u64 offset;
+	size_t size;
+	fsapi_iohandler *iohandler;
+
+	/* Set during pass 1 when the named stream is found. */
+	sys_bool found;
+	sys_bool is_resident;
+	u64 stream_size;
+	u64 stream_non_resident_id;       /* legacy ADS extent-route ID */
+	u64 linked_data_stream_id;        /* snapshot-style indirect ID */
+
+	/* Pass 2 state. */
+	u64 current_data_stream_id;
+	sys_bool in_target_stream;
+	u64 cursor;                       /* bytes already streamed including skips */
+	u64 remaining_bytes;              /* output bytes still wanted */
+} fsapi_node_read_stream_context;
+
+static int fsapi_node_read_stream_visit_stream(
+		void *const _context,
+		const char *const name,
+		const size_t name_length,
+		const u64 data_size,
+		const refs_node_stream_data *const data_reference)
+{
+	fsapi_node_read_stream_context *const context =
+		(fsapi_node_read_stream_context*) _context;
+	int err = 0;
+
+	if(name_length != context->stream_name_length ||
+		memcmp(name, context->stream_name, name_length))
+	{
+		/* Not the stream we are looking for. */
+		goto out;
+	}
+
+	context->found = SYS_TRUE;
+	context->stream_size = data_size;
+
+	if(data_reference->resident) {
+		context->is_resident = SYS_TRUE;
+
+		if(context->iohandler && context->offset < data_size) {
+			const u64 skip = context->offset;
+			const u64 available = data_size - skip;
+			const u64 to_copy =
+				(context->size < available) ?
+				context->size : available;
+
+			err = context->iohandler->copy_data(
+				/* void *context */
+				context->iohandler->context,
+				/* const void *data */
+				((const u8*) data_reference->data.resident) +
+				skip,
+				/* size_t size */
+				(size_t) to_copy);
+			if(err) {
+				goto out;
+			}
+		}
+	}
+	else {
+		context->is_resident = SYS_FALSE;
+		context->stream_non_resident_id =
+			data_reference->data.non_resident.stream_id;
+		context->linked_data_stream_id =
+			data_reference->data.non_resident.linked_data_stream_id;
+
+		if(context->offset < data_size) {
+			const u64 available = data_size - context->offset;
+			context->remaining_bytes =
+				(context->size < available) ?
+				context->size : available;
+		}
+	}
+
+	/* Stop iteration — we found our match. */
+	err = -1;
+
+out:
+	return err;
+}
+
+static int fsapi_node_read_stream_visit_data_stream_id(
+		void *const _context,
+		const u64 stream_id)
+{
+	fsapi_node_read_stream_context *const context =
+		(fsapi_node_read_stream_context*) _context;
+
+	context->current_data_stream_id = stream_id;
+	context->in_target_stream =
+		(stream_id == context->linked_data_stream_id) ?
+		SYS_TRUE : SYS_FALSE;
+	return 0;
+}
+
+static int fsapi_node_read_stream_visit_file_extent(
+		void *const _context,
+		const u64 first_logical_block,
+		const u64 first_physical_block,
+		const u64 block_count,
+		const u32 block_index_unit)
+{
+	fsapi_node_read_stream_context *const context =
+		(fsapi_node_read_stream_context*) _context;
+	int err = 0;
+	u64 extent_phys_off;
+	u64 extent_size;
+	u64 read_offset;
+	u64 read_size;
+
+	(void) first_logical_block;
+
+	if(!context->in_target_stream || !context->remaining_bytes) {
+		goto out;
+	}
+
+	extent_phys_off = first_physical_block * block_index_unit;
+	extent_size = block_count * context->vol->cluster_size;
+
+	/* Fast-forward past extents wholly preceding the requested offset. */
+	if(context->cursor + extent_size <= context->offset) {
+		context->cursor += extent_size;
+		goto out;
+	}
+
+	read_offset = extent_phys_off;
+	read_size = extent_size;
+	if(context->cursor < context->offset) {
+		const u64 skip = context->offset - context->cursor;
+		read_offset += skip;
+		read_size -= skip;
+		context->cursor = context->offset;
+	}
+
+	if(read_size > context->remaining_bytes) {
+		read_size = context->remaining_bytes;
+	}
+
+	err = context->iohandler->handle_io(
+		/* void *context */
+		context->iohandler->context,
+		/* sys_device *dev */
+		context->vol->dev,
+		/* u64 offset */
+		read_offset,
+		/* size_t size */
+		(size_t) read_size);
+	if(err) {
+		goto out;
+	}
+
+	context->cursor += read_size;
+	context->remaining_bytes -= read_size;
+
+	/* Stop the walk once we've collected everything the caller asked for. */
+	if(!context->remaining_bytes) {
+		err = -1;
+	}
+
+out:
+	return err;
+}
+
+static int fsapi_node_read_stream_visit_stream_extent(
+		void *const _context,
+		const u64 stream_id,
+		const u64 first_logical_block,
+		const u64 first_physical_block,
+		const u32 block_index_unit,
+		const u32 cluster_count)
+{
+	fsapi_node_read_stream_context *const context =
+		(fsapi_node_read_stream_context*) _context;
+	int err = 0;
+	u64 extent_phys_off;
+	u64 extent_size;
+	u64 read_offset;
+	u64 read_size;
+
+	(void) first_logical_block;
+
+	if(stream_id != context->stream_non_resident_id ||
+		!context->remaining_bytes)
+	{
+		/* Not the stream we are looking for, or already done. */
+		goto out;
+	}
+
+	extent_phys_off = first_physical_block * block_index_unit;
+	extent_size = cluster_count * context->vol->cluster_size;
+
+	if(context->cursor + extent_size <= context->offset) {
+		context->cursor += extent_size;
+		goto out;
+	}
+
+	read_offset = extent_phys_off;
+	read_size = extent_size;
+	if(context->cursor < context->offset) {
+		const u64 skip = context->offset - context->cursor;
+		read_offset += skip;
+		read_size -= skip;
+		context->cursor = context->offset;
+	}
+
+	if(read_size > context->remaining_bytes) {
+		read_size = context->remaining_bytes;
+	}
+
+	err = context->iohandler->handle_io(
+		/* void *context */
+		context->iohandler->context,
+		/* sys_device *dev */
+		context->vol->dev,
+		/* u64 offset */
+		read_offset,
+		/* size_t size */
+		(size_t) read_size);
+	if(err) {
+		goto out;
+	}
+
+	context->cursor += read_size;
+	context->remaining_bytes -= read_size;
+
+	if(!context->remaining_bytes) {
+		err = -1;
+	}
+
+out:
+	return err;
+}
+
+int fsapi_node_read_stream(
+		fsapi_volume *const vol,
+		fsapi_node *const node,
+		const char *const stream_name,
+		const size_t stream_name_length,
+		const u64 offset,
+		const size_t size,
+		fsapi_iohandler *const iohandler,
+		u64 *const out_stream_size)
+{
+	int err = 0;
+
+	fsapi_node_read_stream_context context;
+	refs_node_crawl_context crawl_context;
+	refs_node_walk_visitor visitor;
+
+	memset(&context, 0, sizeof(context));
+	memset(&crawl_context, 0, sizeof(crawl_context));
+	memset(&visitor, 0, sizeof(visitor));
+
+	fsapi_log_enter("vol=%p, node=%p, stream_name=%p (->%.*s), "
+		"stream_name_length=%" PRIuz ", offset=%" PRIu64 ", "
+		"size=%" PRIuz ", iohandler=%p, out_stream_size=%p",
+		vol, node, stream_name,
+		stream_name ? (int) sys_min(stream_name_length, INT_MAX) : 0,
+		stream_name ? stream_name : "",
+		PRAuz(stream_name_length), PRAu64(offset), PRAuz(size),
+		iohandler, out_stream_size);
+
+	if((!node->key || !node->record) || node->is_short_entry) {
+		err = ENOENT;
+		goto out;
+	}
+
+	crawl_context = refs_volume_init_node_crawl_context(
+		/* refs_volume *vol */
+		vol->vol);
+
+	context.vol = vol->vol;
+	context.stream_name = stream_name;
+	context.stream_name_length = stream_name_length;
+	context.offset = offset;
+	context.size = size;
+	context.iohandler = iohandler;
+
+	/* Pass 1 — find the stream by name and capture metadata. */
+	visitor.context = &context;
+	visitor.node_stream = fsapi_node_read_stream_visit_stream;
+
+	err = parse_level3_long_value(
+		/* refs_node_crawl_context *crawl_context */
+		&crawl_context,
+		/* refs_node_walk_visitor *visitor */
+		&visitor,
+		/* const char *prefix */
+		"",
+		/* size_t indent */
+		1,
+		/* u64 parent_node_object_id */
+		node->parent_directory_object_id,
+		/* u64 node_number */
+		node->node_number,
+		/* u16 entry_offset */
+		node->entry_offset,
+		/* const u8 *key */
+		node->key,
+		/* u16 key_size */
+		node->key_size,
+		/* const u8 *value */
+		node->record,
+		/* u16 value_offset */
+		0,
+		/* u16 value_size */
+		node->record_size,
+		/* void *context */
+		NULL);
+	if(err == -1) {
+		/* Manual break code, this one is expected. */
+		err = 0;
+	}
+	else if(err) {
+		sys_log_perror(err, "Error while parsing node for stream "
+			"lookup");
+		goto out;
+	}
+
+	if(!context.found) {
+		err = ENOENT;
+		goto out;
+	}
+
+	/* Pass 2 — for non-resident streams whose extents live in a
+	 * sibling 0x80 attribute, walk the node again routing extent
+	 * events through the iohandler. The pass is skipped entirely
+	 * when the stream's bytes were already consumed in pass 1
+	 * (resident streams), when there is nothing to read, or when no
+	 * iohandler was supplied. */
+	if(!context.is_resident && context.iohandler &&
+		context.remaining_bytes)
+	{
+		/* Prefer the snapshot-style linked_data_stream_id; fall back
+		 * to the classic ADS stream_id for regular streams whose
+		 * extents come with a matching value. */
+		if(!context.linked_data_stream_id) {
+			context.linked_data_stream_id =
+				context.stream_non_resident_id;
+		}
+
+		if(!context.linked_data_stream_id) {
+			sys_log_warning("Non-resident stream \"%" PRIbs "\" "
+				"has neither a stream_id nor a "
+				"linked_data_stream_id; cannot route extents.",
+				PRAbs(stream_name_length, stream_name));
+			err = EIO;
+			goto out;
+		}
+
+		memset(&visitor, 0, sizeof(visitor));
+		visitor.context = &context;
+		visitor.node_data_stream_id =
+			fsapi_node_read_stream_visit_data_stream_id;
+		visitor.node_file_extent =
+			fsapi_node_read_stream_visit_file_extent;
+		visitor.node_stream_extent =
+			fsapi_node_read_stream_visit_stream_extent;
+
+		sys_log_debug("Walking the entry a second time to read "
+			"non-resident stream data for linked id 0x%" PRIX64
+			" (stream_id 0x%" PRIX64 ")...",
+			PRAX64(context.linked_data_stream_id),
+			PRAX64(context.stream_non_resident_id));
+
+		err = parse_level3_long_value(
+			/* refs_node_crawl_context *crawl_context */
+			&crawl_context,
+			/* refs_node_walk_visitor *visitor */
+			&visitor,
+			/* const char *prefix */
+			"",
+			/* size_t indent */
+			1,
+			/* u64 parent_node_object_id */
+			node->parent_directory_object_id,
+			/* u64 node_number */
+			node->node_number,
+			/* u16 entry_offset */
+			node->entry_offset,
+			/* const u8 *key */
+			node->key,
+			/* u16 key_size */
+			node->key_size,
+			/* const u8 *value */
+			node->record,
+			/* u16 value_offset */
+			0,
+			/* u16 value_size */
+			node->record_size,
+			/* void *context */
+			NULL);
+		if(err == -1) {
+			err = 0;
+		}
+		else if(err) {
+			sys_log_perror(err, "Error while walking node for "
+				"stream extents");
+			goto out;
+		}
+
+		if(context.remaining_bytes) {
+			sys_log_warning("Stream \"%" PRIbs "\" read short: "
+				"%" PRIu64 " bytes outstanding.",
+				PRAbs(stream_name_length, stream_name),
+				PRAu64(context.remaining_bytes));
+		}
+	}
+
+	if(out_stream_size) {
+		*out_stream_size = context.stream_size;
+	}
+
+out:
+	fsapi_log_leave(err, "vol=%p, node=%p, stream_name=%p, "
+		"out_stream_size=%p (->%" PRIu64 ")",
+		vol, node, stream_name,
+		out_stream_size,
+		PRAu64(out_stream_size ? *out_stream_size : 0));
+
+	return err;
+}
+
 int fsapi_node_write_extended_attribute(
 		fsapi_volume *vol,
 		fsapi_node *node,

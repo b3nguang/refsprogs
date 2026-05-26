@@ -7868,6 +7868,7 @@ static int parse_attribute_named_stream_value(
 	}
 	else if(non_resident) {
 		u64 stream_id = 0;
+		u64 linked_data_stream_id = 0;
 
 		emit(prefix, indent, "Non-resident data @ %" PRIuz " / "
 			"0x%" PRIXz " (length: %" PRIuz "):",
@@ -7878,13 +7879,37 @@ static int parse_attribute_named_stream_value(
 				attr_value, &attr_value[k]);
 		}
 
-		if(visitor && visitor->node_stream && stream_id) {
+		/* Peek the next u64 (value offset 0x44 on v3) without
+		 * advancing k — the existing parser below still prints it as
+		 * "Unknown32". For ReFS file snapshots created via
+		 * `refsutil streamsnapshot` this field carries the ID of the
+		 * 0x80 unnamed $DATA attribute that holds the snapshot's
+		 * actual bytes (a separate attribute on the same file). The
+		 * visitor can use it to bridge from the 0xB0 name to the
+		 * matching 0x80's extent list. */
+		if(value_size - k >= 8) {
+			linked_data_stream_id = read_le64(&attr_value[k]);
+		}
+		else if(value_size - k >= 4) {
+			linked_data_stream_id =
+				(u64) read_le32(&attr_value[k]);
+		}
+
+		/* Always fire node_stream for non-resident streams, even when
+		 * stream_id is zero. Snapshot streams (and likely a few other
+		 * ReFS variants) advertise stream_id == 0 and link to their
+		 * data via linked_data_stream_id; the previous `&& stream_id`
+		 * guard caused refsls -s and downstream tools to silently
+		 * drop them. */
+		if(visitor && visitor->node_stream) {
 			refs_node_stream_data data;
 
 			memset(&data, 0, sizeof(data));
 
 			data.resident = SYS_FALSE;
 			data.data.non_resident.stream_id = stream_id;
+			data.data.non_resident.linked_data_stream_id =
+				linked_data_stream_id;
 
 			err = visitor->node_stream(
 				/* void *context */
@@ -8472,6 +8497,22 @@ static int parse_attribute_leaf_value(
 		data_stream_type = read_le16(&key[0x08]);
 		sys_log_debug("Data stream type: 0x%" PRIX16,
 			PRAX16(data_stream_type));
+
+		/* Tell the visitor which data-stream ID is about to have its
+		 * extents reported via node_file_extent. The ID lives at key
+		 * offset 0x10 — ReFS uses 0x1000 for the file's default $DATA
+		 * and other small integers (0x1001 / 0x1002 / ...) for the
+		 * data backing named streams (`:$SNAPSHOT`, normal ADS, ...).
+		 * The matching 0xB0 attribute carries the user-visible name
+		 * and its linked_data_stream_id points back here. */
+		if(visitor && visitor->node_data_stream_id && key_size >= 0x18) {
+			err = visitor->node_data_stream_id(
+				visitor->context,
+				read_le64(&key[0x10]));
+			if(err) {
+				goto out;
+			}
+		}
 
 		if(is_v3 && data_stream_type == 0x1) {
 			err = parse_attribute_resident_data_value(

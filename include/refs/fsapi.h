@@ -727,4 +727,89 @@ int fsapi_node_remove_extended_attribute(
 		const char *xattr_name,
 		size_t xattr_name_length);
 
+/**
+ * List the named data streams of a node (the ReFS equivalent of NTFS
+ * Alternate Data Streams). The default `:$DATA` stream is NOT included
+ * here — it is read through @ref fsapi_node_read. The streams emitted by
+ * this function are the additional ones created by ADS-style features:
+ * regular named ADS, the `:$SNAPSHOT` streams produced by
+ * `refsutil streamsnapshot`, etc.
+ *
+ * @param vol
+ *      (in) The @p fsapi_volume of the mount.
+ * @param node
+ *      (in) The file node whose streams we are listing.
+ * @param context
+ *      (in) (optional) Caller-provided context that will be passed to
+ *      @p stream_handler.
+ * @param stream_handler
+ *      (in) Callback that will be invoked for each named stream. @p name
+ *      is the user-visible stream name (UTF-8); @p data_size is the
+ *      stream's size in bytes; @p is_resident is @ref SYS_TRUE when the
+ *      stream's bytes are inline in the metadata (very small streams).
+ *      Return non-zero from the callback to abort iteration; the error
+ *      value will be propagated as the return value of
+ *      @ref fsapi_node_list_streams. Returning the special value `-1`
+ *      stops iteration cleanly (the function then returns 0).
+ *
+ * @return 0 on success and a non-0 @p errno value on failure.
+ */
+int fsapi_node_list_streams(
+		fsapi_volume *vol,
+		fsapi_node *node,
+		void *context,
+		int (*stream_handler)(
+			void *context,
+			const char *name,
+			size_t name_length,
+			u64 data_size,
+			sys_bool is_resident));
+
+/**
+ * Read from a named data stream of a node, writing the bytes through the
+ * supplied @ref fsapi_iohandler. The default `:$DATA` stream is read via
+ * @ref fsapi_node_read; this function handles every other stream.
+ *
+ * For ReFS file snapshots created with `refsutil streamsnapshot` the
+ * named stream (with a `:$SNAPSHOT` suffix on Windows) acts as a
+ * pointer to a sibling 0x80 unnamed-$DATA attribute on the same file
+ * that holds the snapshot's actual bytes. This function transparently
+ * follows that indirection — callers see the same interface they would
+ * for a regular ADS read.
+ *
+ * @param vol
+ *      (in) The @p fsapi_volume of the mount.
+ * @param node
+ *      (in) The file node containing the stream.
+ * @param stream_name
+ *      (in) The name of the stream to read from (UTF-8, without the
+ *      trailing `:$DATA` / `:$SNAPSHOT` Windows decoration — refsprogs
+ *      stores just the bare name).
+ * @param stream_name_length
+ *      (in) The length of @p stream_name, in bytes.
+ * @param offset
+ *      (in) The byte offset within the stream where reading should
+ *      start.
+ * @param size
+ *      (in) The number of bytes to read.
+ * @param iohandler
+ *      (in) (optional) The @ref fsapi_iohandler that processes the read.
+ *      Pass @p NULL when the caller only wants @p out_stream_size.
+ * @param out_stream_size
+ *      (out) (optional) Pointer to a @ref u64 field that receives the
+ *      stream's total size on successful return.
+ *
+ * @return 0 on success, @p ENOENT when the stream does not exist on
+ *      @p node, or another non-0 @p errno value on other failures.
+ */
+int fsapi_node_read_stream(
+		fsapi_volume *vol,
+		fsapi_node *node,
+		const char *stream_name,
+		size_t stream_name_length,
+		u64 offset,
+		size_t size,
+		fsapi_iohandler *iohandler,
+		u64 *out_stream_size);
+
 #endif /* _REFS_FSAPI_H */
