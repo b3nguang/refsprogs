@@ -8505,6 +8505,25 @@ static int parse_attribute_leaf_value(
 		 * data backing named streams (`:$SNAPSHOT`, normal ADS, ...).
 		 * The matching 0xB0 attribute carries the user-visible name
 		 * and its linked_data_stream_id points back here. */
+		{
+			FILE *dbg = fopen("refs_dbg.log", "a");
+			if(dbg) {
+				fprintf(dbg, "[node.c 0x80 entry] key_size=%u "
+					"visitor=%p ds_cb=%p key[0x10]=",
+					(unsigned) key_size,
+					(void*) visitor,
+					(void*) (visitor ? visitor->node_data_stream_id : NULL));
+				if(key_size >= 0x18) {
+					fprintf(dbg, "%llx",
+						(unsigned long long) read_le64(&key[0x10]));
+				}
+				else {
+					fprintf(dbg, "(too short)");
+				}
+				fprintf(dbg, "\n");
+				fclose(dbg);
+			}
+		}
 		if(visitor && visitor->node_data_stream_id && key_size >= 0x18) {
 			err = visitor->node_data_stream_id(
 				visitor->context,
