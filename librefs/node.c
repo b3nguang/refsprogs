@@ -8500,30 +8500,11 @@ static int parse_attribute_leaf_value(
 
 		/* Tell the visitor which data-stream ID is about to have its
 		 * extents reported via node_file_extent. The ID lives at key
-		 * offset 0x10 — ReFS uses 0x1000 for the file's default $DATA
+		 * offset 0x10. ReFS uses 0x1000 for the file's default $DATA
 		 * and other small integers (0x1001 / 0x1002 / ...) for the
 		 * data backing named streams (`:$SNAPSHOT`, normal ADS, ...).
 		 * The matching 0xB0 attribute carries the user-visible name
 		 * and its linked_data_stream_id points back here. */
-		{
-			FILE *dbg = fopen("refs_dbg.log", "a");
-			if(dbg) {
-				fprintf(dbg, "[node.c 0x80 entry] key_size=%u "
-					"visitor=%p ds_cb=%p key[0x10]=",
-					(unsigned) key_size,
-					(void*) visitor,
-					(void*) (visitor ? visitor->node_data_stream_id : NULL));
-				if(key_size >= 0x18) {
-					fprintf(dbg, "%llx",
-						(unsigned long long) read_le64(&key[0x10]));
-				}
-				else {
-					fprintf(dbg, "(too short)");
-				}
-				fprintf(dbg, "\n");
-				fclose(dbg);
-			}
-		}
 		if(visitor && visitor->node_data_stream_id && key_size >= 0x18) {
 			err = visitor->node_data_stream_id(
 				visitor->context,
@@ -9721,6 +9702,23 @@ int parse_level3_long_value(
 				read_le16(&attribute[attr_key_offset + 0x08]);
 			sys_log_debug("Data stream type: 0x%" PRIX16,
 				PRAX16(data_stream_type));
+
+			/* This inline long-value path bypasses
+			 * parse_attribute_leaf_value(), but still emits
+			 * node_file_extent from the 0x80 value parser. Keep the
+			 * stream-id routing callback in front of those extent
+			 * events so consumers can associate snapshots and other
+			 * named streams with the right data attribute. */
+			if(visitor && visitor->node_data_stream_id &&
+				attr_key_offset + 0x18 <= key_end)
+			{
+				err = visitor->node_data_stream_id(
+					visitor->context,
+					read_le64(&attribute[attr_key_offset + 0x10]));
+				if(err) {
+					goto out;
+				}
+			}
 
 			if(is_v3 && data_stream_type == 0x1) {
 				err = parse_attribute_resident_data_value(
