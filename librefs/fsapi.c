@@ -5338,7 +5338,7 @@ static int fsapi_node_read_stream_visit_stream(
 	int err = 0;
 
 	{
-		FILE *dbg = fopen("/tmp/refs_dbg.log", "a");
+		FILE *dbg = fopen("refs_dbg.log", "a");
 		if(dbg) {
 			fprintf(dbg, "[visit_stream] name=%.*s size=%llu resident=%d "
 				"stream_id=%llx linked=%llx\n",
@@ -5416,7 +5416,7 @@ static int fsapi_node_read_stream_visit_data_stream_id(
 		(fsapi_node_read_stream_context*) _context;
 
 	{
-		FILE *dbg = fopen("/tmp/refs_dbg.log", "a");
+		FILE *dbg = fopen("refs_dbg.log", "a");
 		if(dbg) {
 			fprintf(dbg, "[visit_data_stream_id] id=%llx target=%llx -> %s\n",
 				(unsigned long long) stream_id,
@@ -5451,7 +5451,7 @@ static int fsapi_node_read_stream_visit_file_extent(
 	(void) first_logical_block;
 
 	{
-		FILE *dbg = fopen("/tmp/refs_dbg.log", "a");
+		FILE *dbg = fopen("refs_dbg.log", "a");
 		if(dbg) {
 			fprintf(dbg, "[visit_file_extent] in_target=%d remaining=%llu "
 				"phys=%llu count=%llu unit=%u\n",
