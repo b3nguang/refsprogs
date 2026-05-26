@@ -581,411 +581,45 @@ int sys_unistr_decode(const refschar *ins, size_t ins_len,
 int sys_unistr_encode(const char *ins, size_t ins_len,
 		refschar **outs, size_t *outs_len);
 
+/*
+ * Opaque device handle. Previously this typedef encoded a POSIX file
+ * descriptor cast to `void *` (the inline `sys_device_*` helpers cast it
+ * back to an `int` to call `pread` / `ioctl`). The handle is now an
+ * implementation-defined pointer allocated by `sys_device_open` /
+ * `sys_device_open_callbacks`; callers MUST treat it as opaque and only
+ * touch it via the `sys_device_*` API.
+ */
 typedef void sys_device;
 
-static inline int sys_device_open(sys_device **const dev,
-		const char *const path)
-{
-	int err = 0;
-	int fd = -1;
+/**
+ * Callback dispatch table for `sys_device_open_callbacks`. Lets external
+ * code drive the library's I/O without going through a real file
+ * descriptor — typical use is a Rust / Python wrapper that already owns
+ * the image bytes through a mmap, an EWF reader, a BitLocker decryptor,
+ * etc., and wants `librefs` to call back into its `read` routine instead
+ * of opening a file path locally.
+ *
+ * `user_data` is opaque to refsprogs and forwarded to every callback.
+ * `pread` is mandatory and must return 0 on success or a non-0 `errno`
+ * value on failure. `get_size` is optional (NULL → `sys_device_get_size`
+ * returns ENOTSUP). `close` is optional and is invoked exactly once from
+ * `sys_device_close` so the consumer can release any state attached to
+ * `user_data`.
+ */
+typedef struct {
+	void *user_data;
+	int (*pread)(void *user_data, u64 offset, size_t size, void *buf);
+	int (*get_size)(void *user_data, u64 *out_size);
+	void (*close)(void *user_data);
+} sys_device_callbacks;
 
-	fd = open(
-		path,
-#ifdef O_BINARY
-		O_BINARY |
-#endif
-		O_RDONLY);
-	if(fd == -1) {
-		err = (err = errno) ? err : EIO;
-	}
-	else {
-		*dev = (void*) ((intptr_t) fd);
-	}
+int sys_device_open(sys_device **dev, const char *path);
+int sys_device_open_callbacks(sys_device **dev,
+		const sys_device_callbacks *cb);
+int sys_device_close(sys_device **dev);
+int sys_device_pread(sys_device *dev, u64 offset, size_t nbytes, void *buf);
 
-	return err;
-}
-
-static inline int sys_device_close(sys_device **const dev)
-{
-	int err = 0;
-
-	if(close((int) ((intptr_t) *dev))) {
-		err = (err = errno) ? err : EIO;
-	}
-	else {
-		*dev = (void*) ((intptr_t) -1);
-	}
-
-	return err;
-}
-
-#ifdef _WIN32
-/* As Win32 doesn't have pread and pwrite we provide seek + read|write
- * fallbacks. Watch out for multithreaded use, we'll need a mutex for that. */
-
-static inline ssize_t pread(int fd, void *buf, size_t nbyte, off_t offset)
-{
-	errno = 0;
-
-	if(lseek(fd, offset, SEEK_SET) != offset ||
-		read(fd, buf, nbyte) != (ssize_t) nbyte)
-	{
-		return -1;
-	}
-
-	return (ssize_t) nbyte;
-}
-
-static inline ssize_t pwrite(int fd, void *buf, size_t nbyte, off_t offset)
-{
-	errno = 0;
-
-	if(lseek(fd, offset, SEEK_SET) != offset ||
-		write(fd, buf, nbyte) != (ssize_t) nbyte)
-	{
-		return -1;
-	}
-
-	return (ssize_t) nbyte;
-}
-#endif /* defined(_WIN32) */
-
-static inline int sys_device_pread(sys_device *const dev, const u64 offset,
-		const size_t nbytes, void *const buf)
-{
-	int err = 0;
-	ssize_t res;
-
-	sys_log_debug("pread: offset=%" PRIu64 " nbytes=%" PRIuz,
-		PRAu64(offset), PRAuz(nbytes));
-
-	if(offset > INT64_MAX || nbytes > SSIZE_MAX) {
-		return EINVAL;
-	}
-
-	res = pread(
-		(int) ((intptr_t) dev),
-		buf,
-		nbytes,
-		(off_t) offset);
-	if(res < 0) {
-		err = (err = errno) ? err : EIO;
-	}
-	else if((size_t) res != nbytes) {
-		err = EIO;
-	}
-
-	return err;
-}
-
-static inline int sys_device_get_sector_size(sys_device *const dev,
-		u32 *out_sector_size)
-{
-	int err = ENOTSUP;
-
-#ifdef __linux__
-	int sector_size = 0;
-
-	if(ioctl((int) ((intptr_t) dev), BLKSSZGET, &sector_size)) {
-		err = (err = errno) ? err : EIO;
-	}
-	else {
-		err = 0;
-		*out_sector_size = sector_size;
-	}
-#endif
-
-#ifdef __APPLE__
-	uint32_t block_size = 0;
-
-	if(ioctl((int) ((intptr_t) dev), DKIOCGETBLOCKSIZE, &block_size)) {
-		err = (err = errno) ? err : EIO;
-	}
-	else {
-		err = 0;
-		*out_sector_size = block_size;
-	}
-#endif
-
-#if defined(__FreeBSD__) || defined(__DragonFly__) || defined(__NetBSD__)
-	size_t sector_size = 0;
-
-	if(ioctl((int) ((intptr_t) dev), DIOCGSECTORSIZE, &sector_size)) {
-		err = (err = errno) ? err : EIO;
-	}
-	else {
-		*out_sector_size = (u32) sector_size;
-		err = 0;
-	}
-#endif
-
-#ifdef __OpenBSD__
-	struct disklabel dl;
-
-	memset(&dl, 0, sizeof(dl));
-
-	if(ioctl((int) ((intptr_t) dev), DIOCGDINFO, &dl)) {
-		err = (err = errno) ? err : EIO;
-	}
-	else {
-		*out_sector_size = (u32) dl.d_secsize;
-		err = 0;
-	}
-#endif
-
-#if defined(sun) || defined(__sun)
-	struct dk_minfo_ext minfo_ext;
-
-	if(ioctl((int) ((intptr_t) dev), DKIOCGMEDIAINFOEXT, &minfo_ext) == -1)
-	{
-		struct dk_minfo minfo;
-
-		if(ioctl((int) ((intptr_t) dev), DKIOCGMEDIAINFO, &minfo) == -1)
-		{
-			err = (err = errno) ? err : EIO;
-		}
-		else {
-			*out_sector_size = (u32) minfo.dki_lbsize;
-			err = 0;
-		}
-	}
-	else {
-		*out_sector_size = (u32) minfo_ext.dki_lbsize;
-		err = 0;
-	}
-#endif
-
-#ifdef _WIN32
-	BYTE buf[sizeof(DISK_GEOMETRY) + sizeof(DISK_PARTITION_INFO) +
-		sizeof(DISK_DETECTION_INFO) + 512];
-	DWORD bytes_returned = 0;
-
-	if(DeviceIoControl(
-		/* _In_        HANDLE       hDevice */
-		(HANDLE) _get_osfhandle((int) ((intptr_t) dev)),
-		/* _In_        DWORD        dwIoControlCode */
-		IOCTL_DISK_GET_DRIVE_GEOMETRY_EX,
-		/* _In_opt_    LPVOID       lpInBuffer */
-		NULL,
-		/* _In_        DWORD        nInBufferSize */
-		0,
-		/* _Out_opt_   LPVOID       lpOutBuffer */
-		buf,
-		/* _In_        DWORD        nOutBufferSize */
-		sizeof(buf),
-		/* _Out_opt_   LPDWORD      lpBytesReturned */
-		&bytes_returned,
-		/* _Inout_opt_ LPOVERLAPPED lpOverlapped */
-		NULL))
-	{
-		const DISK_GEOMETRY_EX *const geom =
-			(const DISK_GEOMETRY_EX*) buf;
-
-		if(offsetof(DISK_GEOMETRY_EX, Geometry.BytesPerSector) +
-			sizeof(DWORD) > bytes_returned)
-		{
-			err = EIO;
-		}
-		else {
-			*out_sector_size = geom->Geometry.BytesPerSector;
-			err = 0;
-		}
-	}
-	else {
-		err = EIO;
-	}
-
-	if(err);
-	else if(DeviceIoControl(
-		/* _In_        HANDLE       hDevice */
-		(HANDLE) _get_osfhandle((int) ((intptr_t) dev)),
-		/* _In_        DWORD        dwIoControlCode */
-		IOCTL_DISK_GET_DRIVE_GEOMETRY,
-		/* _In_opt_    LPVOID       lpInBuffer */
-		NULL,
-		/* _In_        DWORD        nInBufferSize */
-		0,
-		/* _Out_opt_   LPVOID       lpOutBuffer */
-		buf,
-		/* _In_        DWORD        nOutBufferSize */
-		sizeof(buf),
-		/* _Out_opt_   LPDWORD      lpBytesReturned */
-		&bytes_returned,
-		/* _Inout_opt_ LPOVERLAPPED lpOverlapped */
-		NULL))
-	{
-		const DISK_GEOMETRY *const geom = (const DISK_GEOMETRY*) buf;
-
-		if(offsetof(DISK_GEOMETRY, BytesPerSector) + sizeof(DWORD) >
-			bytes_returned)
-		{
-			err = EIO;
-		}
-		else {
-			*out_sector_size = geom->BytesPerSector;
-			err = 0;
-		}
-	}
-	else {
-		err = EIO;
-	}
-#endif
-
-	return err;
-}
-
-static inline int sys_device_get_size(sys_device *const dev,
-		u64 *out_size)
-{
-	int err = ENOTSUP;
-	struct stat st;
-
-	if(!fstat((int) ((intptr_t) dev), &st) &&
-		(st.st_mode & S_IFMT) == S_IFREG)
-	{
-		/* Regular file, size can be obtained through stat. */
-		*out_size = st.st_size;
-		return 0;
-	}
-
-#ifdef __linux__
-	{
-		uint64_t device_size = 0;
-
-		if(ioctl((int) ((intptr_t) dev), BLKGETSIZE64, &device_size)) {
-			err = (err = errno) ? err : EIO;
-		}
-		else {
-			err = 0;
-			*out_size = device_size;
-		}
-	}
-#endif
-
-#ifdef __APPLE__
-	{
-		uint32_t block_size = 0;
-
-		if(ioctl((int) ((intptr_t) dev), DKIOCGETBLOCKSIZE,
-			&block_size))
-		{
-			err = (err = errno) ? err : EIO;
-		}
-		else {
-			uint64_t block_count = 0;
-
-			if(ioctl((int) ((intptr_t) dev), DKIOCGETBLOCKCOUNT,
-				&block_count))
-			{
-				err = (err = errno) ? err : EIO;
-			}
-			else {
-				err = 0;
-				*out_size = block_size * block_count;
-			}
-		}
-	}
-#endif
-
-#if defined(__FreeBSD__) || defined(__DragonFly__) || defined(__NetBSD__)
-	{
-		size_t media_size = 0;
-
-		if(ioctl((int) ((intptr_t) dev), DIOCGMEDIASIZE, &media_size)) {
-			err = (err = errno) ? err : EIO;
-		}
-		else {
-			*out_size = media_size;
-			err = 0;
-		}
-	}
-#endif
-
-#ifdef __OpenBSD__
-	{
-		struct stat stbuf;
-		struct disklabel dl;
-
-		memset(&dl, 0, sizeof(dl));
-
-		if(fstat((int) ((intptr_t) dev), &stbuf)) {
-			err = (err = errno) ? err : EIO;
-		}
-		else if(!S_ISBLK(stbuf.st_mode) && !S_ISCHR(stbuf.st_mode)) {
-			err = EINVAL;
-		}
-		else if(ioctl((int) ((intptr_t) dev), DIOCGDINFO, &dl)) {
-			err = (err = errno) ? err : EIO;
-		}
-		else {
-			const struct partition *const part =
-				&dl.d_partitions[DISKPART(stbuf.st_rdev)];
-
-			*out_size =
-				(u64) (DL_GETPSIZE(part)) * (u32) dl.d_secsize;
-			err = 0;
-		}
-	}
-#endif
-
-#if defined(sun) || defined(__sun)
-	{
-		struct dk_minfo_ext minfo_ext;
-
-		if(ioctl((int) ((intptr_t) dev), DKIOCGMEDIAINFOEXT,
-			&minfo_ext) == -1)
-		{
-			struct dk_minfo minfo;
-
-			if(ioctl((int) ((intptr_t) dev), DKIOCGMEDIAINFO,
-				&minfo) == -1)
-			{
-				err = (err = errno) ? err : EIO;
-			}
-			else {
-				*out_size =
-					((u64) minfo.dki_capacity) *
-					(u32) minfo.dki_lbsize;
-				err = 0;
-			}
-		}
-		else {
-			*out_size =
-				((u64) minfo_ext.dki_capacity) *
-				(u32) minfo_ext.dki_lbsize;
-			err = 0;
-		}
-	}
-#endif
-
-#ifdef _WIN32
-	{
-		GET_LENGTH_INFORMATION info = { 0 };
-		DWORD bytes_returned = 0;
-
-		if(!DeviceIoControl(
-			(HANDLE) _get_osfhandle((int) ((intptr_t) dev)),
-			IOCTL_DISK_GET_LENGTH_INFO,
-			NULL,
-			0,
-			&info,
-			sizeof(info),
-			&bytes_returned,
-			NULL))
-		{
-			err = EIO;
-		}
-		else if(bytes_returned != sizeof(info)) {
-			err = EIO;
-		}
-		else {
-			err = 0;
-			*out_size = (u64) info.Length.QuadPart;
-		}
-	}
-#endif
-
-	return err;
-}
+int sys_device_get_sector_size(sys_device *dev, u32 *out_sector_size);
+int sys_device_get_size(sys_device *dev, u64 *out_size);
 
 #endif /* !defined(_REFS_SYS_USER_H) */

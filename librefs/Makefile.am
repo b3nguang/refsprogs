@@ -35,4 +35,5 @@ librefs_la_SOURCES = \
 	rb_tree.c \
 	rb_tree.h \
 	sys.c \
+	sys_user.c \
 	volume.c
