@@ -849,12 +849,27 @@ int fsapi_node_read_stream(
  *      (in) The @ref fsapi_node_attribute_types bitmask to fill in the
  *      @p attributes passed to @p handle_entry for each entry.
  * @param context
- *      (in) (optional) Caller-provided context passed to @p handle_entry.
+ *      (in) (optional) Caller-provided context passed to @p handle_entry and
+ *      @p handle_stream.
  * @param handle_entry
  *      (in) Callback invoked for each directory entry. @p name is the
  *      UTF-8-decoded entry name (NUL-terminated, @p name_length excludes the
  *      terminator). Return non-zero to abort the walk; the value is propagated
  *      as the return value of @ref fsapi_volume_walk_tree.
+ * @param handle_stream
+ *      (in) (optional) Callback invoked for each NAMED data stream
+ *      (refsprogs surfaces these as `:$DATA`/ADS and the `:$SNAPSHOT` streams
+ *      created by `refsutil streamsnapshot`; the default unnamed `$DATA` is
+ *      NOT reported here). It fires after the owning entry's @p handle_entry,
+ *      correlated to that entry via @p owner_parent_object_id + @p owner_name
+ *      (the most recently emitted entry — the same association
+ *      @ref fsapi_node_list_streams would make for that file). @p is_snapshot
+ *      is non-zero when the stream is a `refsutil streamsnapshot` snapshot
+ *      (non-resident, advertises stream id 0 and links its bytes via a
+ *      separate `$DATA` attribute) rather than an ordinary named ADS, so a
+ *      consumer can surface snapshots specifically. Pass @p NULL to skip
+ *      stream reporting entirely (then the walk does no extra work for
+ *      streams). Return non-zero to abort the walk.
  *
  * @return 0 on success and a non-0 @p errno value on failure (or the non-0
  *      value a @p handle_entry callback returned to abort).
@@ -869,6 +884,15 @@ int fsapi_volume_walk_tree(
 			u64 object_id,
 			const char *name,
 			size_t name_length,
-			const fsapi_node_attributes *attributes));
+			const fsapi_node_attributes *attributes),
+		int (*handle_stream)(
+			void *context,
+			u64 owner_parent_object_id,
+			const char *owner_name,
+			size_t owner_name_length,
+			const char *stream_name,
+			size_t stream_name_length,
+			u64 stream_size,
+			sys_bool is_snapshot));
 
 #endif /* _REFS_FSAPI_H */

@@ -3883,6 +3883,23 @@ typedef struct {
 		const char *name,
 		size_t name_length,
 		const fsapi_node_attributes *attributes);
+	int (*handle_stream)(
+		void *context,
+		u64 owner_parent_object_id,
+		const char *owner_name,
+		size_t owner_name_length,
+		const char *stream_name,
+		size_t stream_name_length,
+		u64 stream_size,
+		sys_bool is_snapshot);
+	/* Identity of the most recently emitted entry, so a node_stream event
+	 * (which the node walk fires for the same file right after its
+	 * node_long_entry) can be attributed to its owning file — the same
+	 * cur_name association refsls uses. owner_name is a heap copy owned here
+	 * and freed/replaced on each entry. */
+	u64 cur_owner_parent_object_id;
+	char *cur_owner_name;
+	size_t cur_owner_name_length;
 } fsapi_walk_tree_context;
 
 /**
@@ -3911,6 +3928,61 @@ static int fsapi_walk_tree_visit_symlink(
 	}
 
 	return 0;
+}
+
+/**
+ * Named-stream visitor for the whole-tree walk. The node walk fires this for
+ * every named data stream (ADS plus `refsutil streamsnapshot` snapshots; the
+ * default unnamed `$DATA` is never reported here) right after the owning
+ * file's @ref fsapi_walk_tree_visit_long_entry, so it is attributed to the
+ * current owner recorded in the context.
+ *
+ * A `refsutil streamsnapshot` snapshot stream is distinguished from an
+ * ordinary ADS the same way the snapshot-aware read path is: it is
+ * non-resident and advertises stream id 0 while linking its actual bytes via a
+ * separate `$DATA` attribute (linked_data_stream_id != 0). That classification
+ * is computed here and handed to the caller as @p is_snapshot.
+ */
+static int fsapi_walk_tree_visit_stream(
+		void *const _context,
+		const char *const name,
+		const size_t name_length,
+		const u64 data_size,
+		const refs_node_stream_data *const data_reference)
+{
+	fsapi_walk_tree_context *const context =
+		(fsapi_walk_tree_context*) _context;
+
+	sys_bool is_snapshot = SYS_FALSE;
+
+	if(!context->handle_stream || !context->cur_owner_name) {
+		return 0;
+	}
+
+	if(data_reference && !data_reference->resident &&
+		data_reference->data.non_resident.stream_id == 0 &&
+		data_reference->data.non_resident.linked_data_stream_id != 0)
+	{
+		is_snapshot = SYS_TRUE;
+	}
+
+	return context->handle_stream(
+		/* void *context */
+		context->handle_entry_context,
+		/* u64 owner_parent_object_id */
+		context->cur_owner_parent_object_id,
+		/* const char *owner_name */
+		context->cur_owner_name,
+		/* size_t owner_name_length */
+		context->cur_owner_name_length,
+		/* const char *stream_name */
+		name,
+		/* size_t stream_name_length */
+		name_length,
+		/* u64 stream_size */
+		data_size,
+		/* sys_bool is_snapshot */
+		is_snapshot);
 }
 
 /**
@@ -4040,6 +4112,35 @@ static int fsapi_walk_tree_emit(
 		cname_length,
 		/* const fsapi_node_attributes *attributes */
 		&context->attributes);
+	if(err) {
+		goto out;
+	}
+
+	/* Record this entry as the current stream owner so any node_stream events
+	 * the walk fires next (for this same file) attribute to it. Only when the
+	 * caller wants streams — otherwise we skip the per-entry allocation. */
+	if(context->handle_stream) {
+		char *owner_dup = NULL;
+
+		err = sys_strndup(
+			/* const char *str */
+			cname,
+			/* size_t len */
+			cname_length,
+			/* char **dupstr */
+			&owner_dup);
+		if(err) {
+			goto out;
+		}
+
+		if(context->cur_owner_name) {
+			sys_free(context->cur_owner_name_length + 1,
+				&context->cur_owner_name);
+		}
+		context->cur_owner_name = owner_dup;
+		context->cur_owner_name_length = cname_length;
+		context->cur_owner_parent_object_id = parent_node_object_id;
+	}
 out:
 	if(cname) {
 		sys_free(cname_length + 1, &cname);
@@ -4134,7 +4235,16 @@ int fsapi_volume_walk_tree(
 			u64 object_id,
 			const char *name,
 			size_t name_length,
-			const fsapi_node_attributes *attributes))
+			const fsapi_node_attributes *attributes),
+		int (*handle_stream)(
+			void *context,
+			u64 owner_parent_object_id,
+			const char *owner_name,
+			size_t owner_name_length,
+			const char *stream_name,
+			size_t stream_name_length,
+			u64 stream_size,
+			sys_bool is_snapshot))
 {
 	int err = 0;
 	fsapi_walk_tree_context walk_context;
@@ -4144,8 +4254,9 @@ int fsapi_volume_walk_tree(
 	memset(&visitor, 0, sizeof(visitor));
 
 	fsapi_log_enter("vol=%p, requested_attributes=0x%" PRIX32 ", "
-		"context=%p, handle_entry=%p",
-		vol, PRAX32(requested_attributes), context, handle_entry);
+		"context=%p, handle_entry=%p, handle_stream=%p",
+		vol, PRAX32(requested_attributes), context, handle_entry,
+		handle_stream);
 
 	if(!handle_entry) {
 		err = EINVAL;
@@ -4156,10 +4267,16 @@ int fsapi_volume_walk_tree(
 	walk_context.attributes.requested = requested_attributes;
 	walk_context.handle_entry_context = context;
 	walk_context.handle_entry = handle_entry;
+	walk_context.handle_stream = handle_stream;
 
 	visitor.context = &walk_context;
 	visitor.node_long_entry = fsapi_walk_tree_visit_long_entry;
 	visitor.node_short_entry = fsapi_walk_tree_visit_short_entry;
+	/* Only wire the stream visitor when the caller wants streams, so a
+	 * stream-less walk does no extra per-attribute work. */
+	if(handle_stream) {
+		visitor.node_stream = fsapi_walk_tree_visit_stream;
+	}
 
 	/* object_id == NULL => cover the entire metadata tree in one pass. */
 	err = refs_node_walk(
@@ -4191,9 +4308,15 @@ int fsapi_volume_walk_tree(
 		sys_log_perror(err, "Error while walking volume tree");
 	}
 
+	if(walk_context.cur_owner_name) {
+		sys_free(walk_context.cur_owner_name_length + 1,
+			&walk_context.cur_owner_name);
+	}
+
 	fsapi_log_leave(err, "vol=%p, requested_attributes=0x%" PRIX32 ", "
-		"context=%p, handle_entry=%p",
-		vol, PRAX32(requested_attributes), context, handle_entry);
+		"context=%p, handle_entry=%p, handle_stream=%p",
+		vol, PRAX32(requested_attributes), context, handle_entry,
+		handle_stream);
 out:
 	return err;
 }
