@@ -3873,6 +3873,7 @@ out:
  * per-entry attribute storage.
  */
 typedef struct {
+	fsapi_volume *vol;
 	fsapi_node_attributes attributes;
 	void *handle_entry_context;
 	int (*handle_entry)(
@@ -3883,6 +3884,34 @@ typedef struct {
 		size_t name_length,
 		const fsapi_node_attributes *attributes);
 } fsapi_walk_tree_context;
+
+/**
+ * Symlink visitor for the reparse-point resolution sub-walk: mirrors
+ * @ref fsapi_node_list_visit_symlink's effect on the attribute buffer (set
+ * @p size to the target length when SIZE is requested) so a directory junction
+ * carries the same size a per-directory @ref fsapi_node_list listing would
+ * report. MODE / SYMLINK_TARGET are intentionally not touched — the whole-tree
+ * walk only requests SIZE-class attributes (matching the snapshot listing).
+ */
+static int fsapi_walk_tree_visit_symlink(
+		void *const _context,
+		const refs_symlink_type type,
+		const char *const target,
+		const size_t target_length)
+{
+	fsapi_walk_tree_context *const context =
+		(fsapi_walk_tree_context*) _context;
+
+	(void) type;
+	(void) target;
+
+	if(context->attributes.requested & FSAPI_NODE_ATTRIBUTE_TYPE_SIZE) {
+		context->attributes.size = target_length;
+		context->attributes.valid |= FSAPI_NODE_ATTRIBUTE_TYPE_SIZE;
+	}
+
+	return 0;
+}
 
 /**
  * Common tail for both entry kinds: fill the reused attribute buffer exactly
@@ -3939,6 +3968,49 @@ static int fsapi_walk_tree_emit(
 		allocated_size);
 	if(err) {
 		goto out;
+	}
+
+	/* For a reparse point (e.g. a directory junction), the per-directory
+	 * fsapi_node_list resolves the symlink target and reports its length as
+	 * the entry size. Replicate that here with the same secondary node walk so
+	 * the whole-tree listing is byte-identical to a per-directory listing. The
+	 * entry's own object_id is the node to walk; only directories carry a
+	 * non-zero object_id (files use 0), but reparse files would resolve the
+	 * same way if ReFS ever surfaced them through the short-entry path. */
+	if((file_flags & REFS_FILE_ATTRIBUTE_REPARSE_POINT) && object_id &&
+		context->vol)
+	{
+		refs_node_walk_visitor reparse_visitor;
+		u64 reparse_object_id = object_id;
+
+		memset(&reparse_visitor, 0, sizeof(reparse_visitor));
+		reparse_visitor.context = context;
+		reparse_visitor.node_symlink = fsapi_walk_tree_visit_symlink;
+
+		err = refs_node_walk(
+			/* sys_device *dev */
+			context->vol->vol->dev,
+			/* const REFS_BOOT_SECTOR *bs */
+			context->vol->vol->bs,
+			/* REFS_SUPERBLOCK_HEADER **sb */
+			&context->vol->vol->sb,
+			/* REFS_LEVEL1_NODE **primary_level1_node */
+			&context->vol->vol->primary_level1_node,
+			/* REFS_LEVEL1_NODE **secondary_level1_node */
+			&context->vol->vol->secondary_level1_node,
+			/* refs_block_map **block_map */
+			&context->vol->vol->block_map,
+			/* refs_node_cache **node_cache */
+			&context->vol->vol->node_cache,
+			/* const u64 *start_node */
+			NULL,
+			/* const u64 *object_id */
+			&reparse_object_id,
+			/* refs_node_walk_visitor *visitor */
+			&reparse_visitor);
+		if(err) {
+			goto out;
+		}
 	}
 
 	err = sys_unistr_decode(
@@ -4080,6 +4152,7 @@ int fsapi_volume_walk_tree(
 		goto out;
 	}
 
+	walk_context.vol = vol;
 	walk_context.attributes.requested = requested_attributes;
 	walk_context.handle_entry_context = context;
 	walk_context.handle_entry = handle_entry;
