@@ -812,4 +812,63 @@ int fsapi_node_read_stream(
 		fsapi_iohandler *iohandler,
 		u64 *out_stream_size);
 
+/**
+ * Walk the whole filesystem directory tree of a mounted volume in a single
+ * sequential metadata pass, invoking @p handle_entry once for every directory
+ * entry encountered (files, directories, hard links and reparse points alike).
+ *
+ * This is the bulk-enumeration counterpart to @ref fsapi_node_list: instead of
+ * one targeted B-tree descent per directory (N descents to enumerate a tree of
+ * N directories — each one re-reading metadata pages through the underlying
+ * device), it drives a single @ref refs_node_walk over the entire metadata tree
+ * (`object_id == NULL`), so every node block is read at most once and in a
+ * mostly sequential order. On image-backed / network volumes where each read is
+ * expensive (e.g. an E01 evidence file going through libewf decompression) this
+ * turns a whole-volume snapshot from O(directories) random reads into O(1)
+ * streaming passes.
+ *
+ * Each entry is reported with the object ID of its parent directory
+ * (@p parent_object_id) and, for entries that are themselves directories, the
+ * directory's own object ID (@p object_id; 0 for non-directories). A consumer
+ * can rebuild the full tree in memory by grouping entries under
+ * @p parent_object_id and following @p object_id to descend, with the volume
+ * root being object ID 0x600.
+ *
+ * The @p attributes reported for each entry are filled exactly as
+ * @ref fsapi_node_list would fill them for the same entry (same attribute
+ * conversion, same @ref fsapi_node_attributes::is_directory determination), so
+ * the resulting listing is identical to what repeated @ref fsapi_node_list
+ * calls would produce — only obtained in one pass. No symlink-target resolution
+ * is performed (it would require a secondary descent per reparse point); use
+ * @ref fsapi_node_lookup / @ref fsapi_node_get_attributes on the specific node
+ * if a target is needed.
+ *
+ * @param vol
+ *      (in) The @p fsapi_volume of the mount.
+ * @param requested_attributes
+ *      (in) The @ref fsapi_node_attribute_types bitmask to fill in the
+ *      @p attributes passed to @p handle_entry for each entry.
+ * @param context
+ *      (in) (optional) Caller-provided context passed to @p handle_entry.
+ * @param handle_entry
+ *      (in) Callback invoked for each directory entry. @p name is the
+ *      UTF-8-decoded entry name (NUL-terminated, @p name_length excludes the
+ *      terminator). Return non-zero to abort the walk; the value is propagated
+ *      as the return value of @ref fsapi_volume_walk_tree.
+ *
+ * @return 0 on success and a non-0 @p errno value on failure (or the non-0
+ *      value a @p handle_entry callback returned to abort).
+ */
+int fsapi_volume_walk_tree(
+		fsapi_volume *vol,
+		fsapi_node_attribute_types requested_attributes,
+		void *context,
+		int (*handle_entry)(
+			void *context,
+			u64 parent_object_id,
+			u64 object_id,
+			const char *name,
+			size_t name_length,
+			const fsapi_node_attributes *attributes));
+
 #endif /* _REFS_FSAPI_H */

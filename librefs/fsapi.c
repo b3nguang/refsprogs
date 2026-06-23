@@ -3866,6 +3866,265 @@ out:
 	return err;
 }
 
+/**
+ * Context threaded through a @ref fsapi_volume_walk_tree pass. The single
+ * @p attributes buffer is reused for every entry (its @p requested mask is
+ * preserved by @ref fsapi_fill_attributes), so the whole walk allocates no
+ * per-entry attribute storage.
+ */
+typedef struct {
+	fsapi_node_attributes attributes;
+	void *handle_entry_context;
+	int (*handle_entry)(
+		void *context,
+		u64 parent_object_id,
+		u64 object_id,
+		const char *name,
+		size_t name_length,
+		const fsapi_node_attributes *attributes);
+} fsapi_walk_tree_context;
+
+/**
+ * Common tail for both entry kinds: fill the reused attribute buffer exactly
+ * as @ref fsapi_node_list_filldir would, decode the UTF-16 name to UTF-8 and
+ * hand the entry to the caller's callback.
+ */
+static int fsapi_walk_tree_emit(
+		fsapi_walk_tree_context *const context,
+		const sys_bool is_directory,
+		const u64 object_id,
+		const refschar *const file_name,
+		const u16 file_name_length,
+		const u16 child_entry_offset,
+		const u32 file_flags,
+		const u64 node_number,
+		const u64 parent_node_object_id,
+		const u64 create_time,
+		const u64 last_access_time,
+		const u64 last_write_time,
+		const u64 last_mft_change_time,
+		const u64 file_size,
+		const u64 allocated_size)
+{
+	int err = 0;
+	char *cname = NULL;
+	size_t cname_length = 0;
+
+	err = fsapi_fill_attributes(
+		/* fsapi_node_attributes *attrs */
+		&context->attributes,
+		/* sys_bool is_directory */
+		is_directory,
+		/* u16 child_entry_offset */
+		child_entry_offset,
+		/* u32 file_flags */
+		file_flags,
+		/* u64 node_number */
+		node_number,
+		/* u64 parent_node_object_id */
+		parent_node_object_id,
+		/* u64 link_count */
+		1,
+		/* u64 create_time */
+		create_time,
+		/* u64 last_access_time */
+		last_access_time,
+		/* u64 last_write_time */
+		last_write_time,
+		/* u64 last_mft_change_time */
+		last_mft_change_time,
+		/* u64 file_size */
+		file_size,
+		/* u64 allocated_size */
+		allocated_size);
+	if(err) {
+		goto out;
+	}
+
+	err = sys_unistr_decode(
+		/* const refschar *ins */
+		file_name,
+		/* size_t ins_len */
+		file_name_length,
+		/* char **outs */
+		&cname,
+		/* size_t *outs_len */
+		&cname_length);
+	if(err) {
+		sys_log_perror(err, "Error while decoding filename string");
+		goto out;
+	}
+
+	err = context->handle_entry(
+		/* void *context */
+		context->handle_entry_context,
+		/* u64 parent_object_id */
+		parent_node_object_id,
+		/* u64 object_id */
+		object_id,
+		/* const char *name */
+		cname,
+		/* size_t name_length */
+		cname_length,
+		/* const fsapi_node_attributes *attributes */
+		&context->attributes);
+out:
+	if(cname) {
+		sys_free(cname_length + 1, &cname);
+	}
+
+	return err;
+}
+
+static int fsapi_walk_tree_visit_long_entry(
+		void *const _context,
+		const refschar *const file_name,
+		const u16 file_name_length,
+		const u16 child_entry_offset,
+		const u32 file_flags,
+		const u64 node_number,
+		const u64 parent_node_object_id,
+		const u64 create_time,
+		const u64 last_access_time,
+		const u64 last_write_time,
+		const u64 last_mft_change_time,
+		const u64 file_size,
+		const u64 allocated_size,
+		const u8 *const key,
+		const size_t key_size,
+		const u8 *const record,
+		const size_t record_size)
+{
+	(void) key;
+	(void) key_size;
+	(void) record;
+	(void) record_size;
+
+	/* Long entries are always files / links / reparse points (never
+	 * directories), matching fsapi_node_list_visit_long_entry. */
+	return fsapi_walk_tree_emit(
+		(fsapi_walk_tree_context*) _context,
+		/* sys_bool is_directory */
+		SYS_FALSE,
+		/* u64 object_id */
+		0,
+		file_name, file_name_length, child_entry_offset, file_flags,
+		node_number, parent_node_object_id, create_time, last_access_time,
+		last_write_time, last_mft_change_time, file_size, allocated_size);
+}
+
+static int fsapi_walk_tree_visit_short_entry(
+		void *const _context,
+		const refschar *const file_name,
+		const u16 file_name_length,
+		const u16 child_entry_offset,
+		const u32 file_flags,
+		const u64 node_number,
+		const u64 parent_node_object_id,
+		const u64 object_id,
+		const u64 hard_link_id,
+		const u64 create_time,
+		const u64 last_access_time,
+		const u64 last_write_time,
+		const u64 last_mft_change_time,
+		const u64 file_size,
+		const u64 allocated_size,
+		const u8 *const key,
+		const size_t key_size,
+		const u8 *const record,
+		const size_t record_size)
+{
+	(void) hard_link_id;
+	(void) key;
+	(void) key_size;
+	(void) record;
+	(void) record_size;
+
+	/* Directory determination matches fsapi_node_list_visit_short_entry. */
+	return fsapi_walk_tree_emit(
+		(fsapi_walk_tree_context*) _context,
+		/* sys_bool is_directory */
+		(file_flags & 0x10000000UL) ? SYS_TRUE : SYS_FALSE,
+		/* u64 object_id */
+		object_id,
+		file_name, file_name_length, child_entry_offset, file_flags,
+		node_number, parent_node_object_id, create_time, last_access_time,
+		last_write_time, last_mft_change_time, file_size, allocated_size);
+}
+
+int fsapi_volume_walk_tree(
+		fsapi_volume *vol,
+		fsapi_node_attribute_types requested_attributes,
+		void *context,
+		int (*handle_entry)(
+			void *context,
+			u64 parent_object_id,
+			u64 object_id,
+			const char *name,
+			size_t name_length,
+			const fsapi_node_attributes *attributes))
+{
+	int err = 0;
+	fsapi_walk_tree_context walk_context;
+	refs_node_walk_visitor visitor;
+
+	memset(&walk_context, 0, sizeof(walk_context));
+	memset(&visitor, 0, sizeof(visitor));
+
+	fsapi_log_enter("vol=%p, requested_attributes=0x%" PRIX32 ", "
+		"context=%p, handle_entry=%p",
+		vol, PRAX32(requested_attributes), context, handle_entry);
+
+	if(!handle_entry) {
+		err = EINVAL;
+		goto out;
+	}
+
+	walk_context.attributes.requested = requested_attributes;
+	walk_context.handle_entry_context = context;
+	walk_context.handle_entry = handle_entry;
+
+	visitor.context = &walk_context;
+	visitor.node_long_entry = fsapi_walk_tree_visit_long_entry;
+	visitor.node_short_entry = fsapi_walk_tree_visit_short_entry;
+
+	/* object_id == NULL => cover the entire metadata tree in one pass. */
+	err = refs_node_walk(
+		/* sys_device *dev */
+		vol->vol->dev,
+		/* const REFS_BOOT_SECTOR *bs */
+		vol->vol->bs,
+		/* REFS_SUPERBLOCK_HEADER **sb */
+		&vol->vol->sb,
+		/* REFS_LEVEL1_NODE **primary_level1_node */
+		&vol->vol->primary_level1_node,
+		/* REFS_LEVEL1_NODE **secondary_level1_node */
+		&vol->vol->secondary_level1_node,
+		/* refs_block_map **block_map */
+		&vol->vol->block_map,
+		/* refs_node_cache **node_cache */
+		&vol->vol->node_cache,
+		/* const u64 *start_node */
+		NULL,
+		/* const u64 *object_id */
+		NULL,
+		/* refs_node_walk_visitor *visitor */
+		&visitor);
+	if(err == -1) {
+		/* A callback asked to stop the walk cleanly. */
+		err = 0;
+	}
+	else if(err) {
+		sys_log_perror(err, "Error while walking volume tree");
+	}
+
+	fsapi_log_leave(err, "vol=%p, requested_attributes=0x%" PRIX32 ", "
+		"context=%p, handle_entry=%p",
+		vol, PRAX32(requested_attributes), context, handle_entry);
+out:
+	return err;
+}
+
 int fsapi_node_get_attributes(
 		fsapi_volume *vol,
 		fsapi_node *node,
